@@ -1,5 +1,6 @@
 import os
 print("Rodando em:", os.getcwd())
+
 import re
 import ssl
 import smtplib
@@ -8,10 +9,10 @@ import traceback
 from typing import List, Dict, Any
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -23,12 +24,8 @@ from email.mime.application import MIMEApplication
 
 BASE_URL = "https://senffnet.vtexcommercestable.com.br"
 
-#Credenciais do ambiente:
 VTEX_APP_KEY = os.getenv("VTEX_APP_KEY")
-VTEX_APP_TOKEN = os.getenv("VTEX_APP_TOKEN") 
-
-BASE_OUTPUT_DIR = "output"
-CONFIG_SELLERS_FILE = "config/lista_sellers.xlsx"
+VTEX_APP_TOKEN = os.getenv("VTEX_APP_TOKEN")
 
 SMTP_SERVER = "smtp.skymail.net.br"
 SMTP_PORT = 465
@@ -36,15 +33,32 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 EMAIL_FROM = SMTP_USER
 
+BASE_OUTPUT_DIR = "output"
+CONFIG_SELLERS_FILE = "config/lista_sellers.xlsx"
+
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "vtex_vendas_faturadas.log")
+
 DEFAULT_MAX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
 HTTP_TIMEOUT = 30
 
-LOG_FILE = r"D:/BI - SENFF SHOPPING/Relatorios_API-VTEX/VENDAS_FATURADAS/vtex_vendas_faturadas.log"
+TZ_BR = timezone(timedelta(hours=-3))
+
+
+# =========================================================
+# VALIDAÇÕES INICIAIS
+# =========================================================
+
+if not all([VTEX_APP_KEY, VTEX_APP_TOKEN, SMTP_USER, SMTP_PASSWORD]):
+    raise RuntimeError("❌ Variáveis de ambiente obrigatórias não definidas")
 
 
 # =========================================================
 # LOGS
 # =========================================================
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,11 +91,23 @@ def formatar_data_curta(iso_str: str):
     if not iso_str:
         return ""
     try:
-        iso_norm = iso_str.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(iso_norm).astimezone(timezone(timedelta(hours=-3)))
-        return dt.strftime("%d/%m/%y")
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone(TZ_BR)
+        return dt.strftime("%d/%m/%Y")
     except:
         return iso_str
+
+
+def br_yesterday_window_to_utc():
+    hoje = datetime.now(TZ_BR).date()
+    ontem = hoje - timedelta(days=1)
+
+    start = datetime(ontem.year, ontem.month, ontem.day, 0, 0, 0, tzinfo=TZ_BR)
+    end   = datetime(ontem.year, ontem.month, ontem.day, 23, 59, 59, 999000, tzinfo=TZ_BR)
+
+    start_utc = start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    end_utc   = end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    return start_utc, end_utc, ontem.strftime("%Y-%m-%d"), ontem.strftime("%d/%m/%Y")
 
 
 def carregar_sellers_config() -> List[Dict[str, Any]]:
@@ -104,22 +130,8 @@ def carregar_sellers_config() -> List[Dict[str, Any]]:
             "emailCc": limpar(row.get("emailCc")),
         })
 
-    log(f"📌 Sellers carregados: {[s['display'] for s in sellers]}")
+    log(f"📌 Sellers ativos: {[s['display'] for s in sellers]}")
     return sellers
-
-
-def br_yesterday_window_to_utc():
-    tz = timezone(timedelta(hours=-3))
-    hoje = datetime.now(tz).date()
-    ontem = hoje - timedelta(days=1)
-
-    start = datetime(ontem.year, ontem.month, ontem.day, 0, 0, 0, tzinfo=tz)
-    end   = datetime(ontem.year, ontem.month, ontem.day, 23, 59, 59, 999000, tzinfo=tz)
-
-    start_utc = start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    end_utc   = end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-    return start_utc, end_utc, ontem.strftime("%Y-%m-%d"), ontem.strftime("%d/%m/%Y")
 
 
 # =========================================================
@@ -161,120 +173,54 @@ def listar_pedidos_resumidos_por_seller(start_utc, end_utc, seller_name):
 
 
 def fetch_order_detail(order_id):
-    url = f"{BASE_URL}/api/oms/pvt/orders/{order_id}"
     try:
-        resp = requests.get(url, headers=vtex_headers(), timeout=HTTP_TIMEOUT)
-        if resp.status_code == 200:
-            return resp.json()
+        r = requests.get(
+            f"{BASE_URL}/api/oms/pvt/orders/{order_id}",
+            headers=vtex_headers(),
+            timeout=HTTP_TIMEOUT
+        )
+        if r.status_code == 200:
+            return r.json()
     except:
         pass
-    return {}
-
-
-def buscar_detalhes_pedidos(orders):
-    if not orders:
-        return {}
-
-    detalhes = {}
-    max_workers = min(DEFAULT_MAX_WORKERS, len(orders))
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(fetch_order_detail, o["orderId"]): o["orderId"] for o in orders}
-
-        for f in as_completed(futures):
-            oid = futures[f]
-            try:
-                det = f.result()
-                if det:
-                    detalhes[oid] = det
-            except:
-                pass
-
-    return detalhes
+    return None
 
 
 # =========================================================
-# TRANSFORMAÇÕES
+# PROCESSAMENTO
 # =========================================================
 
 def get_total_by_id(totals, code):
     for t in totals or []:
         if t.get("id") == code:
-            return (t.get("value", 0) / 100.0)
+            return t.get("value", 0) / 100
     return 0.0
 
 
-def extrair_pedido_seller(seller_order_id):
-    if not seller_order_id:
-        return ""
-    partes = seller_order_id.split("-")
-    if len(partes) < 2:
-        return ""
-    bloco = re.sub(r"\D", "", partes[-2])
-    return bloco[-7:] if len(bloco) >= 7 else ""
-
-
 def gerar_linhas_por_seller(order, seller_cfg):
-    linhas = []
-    sellers = order.get("sellers", [])
-    seller_ids = [s.get("id") for s in sellers]
-
+    seller_ids = [s.get("id") for s in order.get("sellers", [])]
     if seller_cfg["id"] not in seller_ids:
         return []
 
     totals = order.get("totals", [])
-    total_itens = get_total_by_id(totals, "Items")
-    frete = get_total_by_id(totals, "Shipping")
-
-    pagamento_linhas = []
+    linhas = []
 
     for tx in order.get("paymentData", {}).get("transactions", []):
-        if tx.get("isActive"):
-            pagamento_linhas.extend(tx.get("payments", []))
+        if not tx.get("isActive"):
+            continue
 
-    if not pagamento_linhas:
-        pagamento_linhas = [None]
+        for pm in tx.get("payments", [])[:2]:
+            linhas.append({
+                "Faturado em": formatar_data_curta(order.get("invoicedDate")),
+                "Pedido_Senff": order.get("orderId"),
+                "Seller": seller_cfg["display"],
+                "Frete": get_total_by_id(totals, "Shipping"),
+                "Total_itens": get_total_by_id(totals, "Items"),
+                "Valor_total": get_total_by_id(totals, "Shipping") + get_total_by_id(totals, "Items"),
+                "Parcelas": pm.get("installments")
+            })
 
-    linhas_final = []
-
-    for pm in pagamento_linhas[:2]:
-        parcelas = pm.get("installments") if pm else None
-        linhas_final.append({
-            "Faturado em": formatar_data_curta(order.get("invoicedDate")),
-            "Pedido_Senff": order.get("orderId"),
-            "Pedido_Seller": extrair_pedido_seller(order.get("sellerOrderId", "")),
-            "Status": order.get("statusDescription"),
-            "Seller": seller_cfg["display"],
-            "Frete": frete,
-            "Total_itens": total_itens,
-            "Valor_total": frete + total_itens,
-            "Parcelas": parcelas
-        })
-
-    return linhas_final
-
-
-# =========================================================
-# XLSX
-# =========================================================
-
-def salvar_xlsx(seller_cfg, linhas, data_iso):
-    if not linhas:
-        return None
-
-    df = pd.DataFrame(linhas)
-
-    # 🔥 AQUI: Remoção de duplicatas ANTES de salvar
-    df = df.drop_duplicates()
-
-    df.sort_values(by=["Pedido_Senff", "Parcelas"], inplace=True)
-
-    os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
-    filename = f"vendas_{data_iso}_{seller_cfg['display'].replace(' ', '_')}.xlsx"
-    path = os.path.join(BASE_OUTPUT_DIR, filename)
-
-    df.to_excel(path, index=False)
-    return path
+    return linhas
 
 
 # =========================================================
@@ -282,49 +228,30 @@ def salvar_xlsx(seller_cfg, linhas, data_iso):
 # =========================================================
 
 def enviar_email(arquivo, seller_cfg, data_brt):
-
-    if not arquivo:
-        return
-
-    to_list = seller_cfg["emailTo"]
-    cc_list = seller_cfg["emailCc"]
-
-    if not to_list:
-        log(f"⚠ Seller {seller_cfg['display']} não tem emailTo configurado.")
+    if not arquivo or not seller_cfg["emailTo"]:
         return
 
     msg = MIMEMultipart()
     msg["From"] = EMAIL_FROM
-    msg["To"] = ", ".join(to_list)
-    if cc_list:
-        msg["Cc"] = ", ".join(cc_list)
+    msg["To"] = ", ".join(seller_cfg["emailTo"])
+    if seller_cfg["emailCc"]:
+        msg["Cc"] = ", ".join(seller_cfg["emailCc"])
 
     msg["Subject"] = f"Vendas Faturadas – {seller_cfg['display']} – {data_brt}"
 
-    texto = f"""
-Olá,
-
-Segue em anexo o relatório de vendas faturadas no Senff Shopping referente ao dia {data_brt}.
-
-Atenciosamente,
-Equipe Senff
-"""
-    msg.attach(MIMEText(texto, "plain"))
+    msg.attach(MIMEText(
+        f"Segue relatório de vendas faturadas referente a {data_brt}.",
+        "plain"
+    ))
 
     with open(arquivo, "rb") as f:
-        part = MIMEApplication(f.read(), _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        part = MIMEApplication(f.read(), _subtype="xlsx")
+        part.add_header("Content-Disposition", "attachment", filename=os.path.basename(arquivo))
+        msg.attach(part)
 
-    part.add_header("Content-Disposition", "attachment", filename=os.path.basename(arquivo))
-    msg.attach(part)
-
-    try:
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            recipients = to_list + cc_list
-            server.sendmail(EMAIL_FROM, recipients, msg.as_string())
-
-    except Exception as e:
-        log(f"❌ Erro envio email: {e}")
+    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(EMAIL_FROM, seller_cfg["emailTo"] + seller_cfg["emailCc"], msg.as_string())
 
 
 # =========================================================
@@ -336,26 +263,33 @@ def main():
         start_utc, end_utc, data_iso, data_brt = br_yesterday_window_to_utc()
         sellers = carregar_sellers_config()
 
-        for seller_cfg in sellers:
-            log(f"\n===== PROCESSANDO: {seller_cfg['display']} =====")
+        for seller in sellers:
+            log(f"▶ Processando {seller['display']}")
 
-            summary = listar_pedidos_resumidos_por_seller(start_utc, end_utc, seller_cfg["display"])
-            if not summary:
-                log(f"⚠ Sem pedidos. Pulando...")
+            resumo = listar_pedidos_resumidos_por_seller(start_utc, end_utc, seller["display"])
+            if not resumo:
+                log("⚠ Sem pedidos")
                 continue
 
-            detalhes = buscar_detalhes_pedidos(summary)
+            detalhes = {}
+            with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as ex:
+                futures = {ex.submit(fetch_order_detail, o["orderId"]): o["orderId"] for o in resumo}
+                for f in as_completed(futures):
+                    if f.result():
+                        detalhes[futures[f]] = f.result()
 
             linhas = []
-            for o in summary:
-                oid = o.get("orderId")
-                if oid in detalhes:
-                    linhas.extend(gerar_linhas_por_seller(detalhes[oid], seller_cfg))
+            for o in resumo:
+                if o["orderId"] in detalhes:
+                    linhas.extend(gerar_linhas_por_seller(detalhes[o["orderId"]], seller))
 
-            arquivo = salvar_xlsx(seller_cfg, linhas, data_iso)
-            enviar_email(arquivo, seller_cfg, data_brt)
+            if linhas:
+                df = pd.DataFrame(linhas).drop_duplicates()
+                path = os.path.join(BASE_OUTPUT_DIR, f"vendas_{data_iso}_{seller['display'].replace(' ', '_')}.xlsx")
+                df.to_excel(path, index=False)
+                enviar_email(path, seller, data_brt)
 
-        log("✅ Processo finalizado.")
+        log("✅ Processo finalizado")
 
     except Exception:
         traceback.print_exc()
