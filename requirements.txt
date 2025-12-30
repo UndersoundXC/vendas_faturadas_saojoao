@@ -1,0 +1,11 @@
+requests
+pandas
+openpyxl
+tqdm
+smtplib
+logging
+traceback
+typing
+datetime
+functools
+re
