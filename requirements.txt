@@ -1,11 +1,4 @@
-requests
-pandas
-openpyxl
-tqdm
-smtplib
-logging
-traceback
-typing
-datetime
-functools
-re
+import requests
+import pandas as pd
+from tqdm import tqdm
+import openpyxl  # usado pelo pandas para Excel
